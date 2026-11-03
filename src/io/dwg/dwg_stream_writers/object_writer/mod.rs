@@ -133,6 +133,12 @@ pub struct DwgObjectWriter<'a> {
     /// object when the owner carries no xdictionary handle; called once per written
     /// object that is O(objects²) — ~0.35 s of a 1.9 s write on a 5 500-object drawing.
     pub(super) xdic_owner_index: std::sync::Arc<std::collections::HashMap<Handle, Handle>>,
+    /// Every handle that will exist in the written file (entities incl. their
+    /// attributes, objects, table records, tables). Reactors pointing anywhere
+    /// else are dropped on write — a deleted DIMENSION otherwise stays listed in
+    /// its DIMSTYLE's reactors (and a deleted VIEWPORT in its layout's), and
+    /// readers report "Object handle not found" / "Object was erased".
+    pub(super) live_handles: std::sync::Arc<HashSet<u64>>,
 }
 
 struct ParallelEntityBatch {
@@ -264,7 +270,30 @@ impl<'a> DwgObjectWriter<'a> {
             owner_overrides: std::collections::HashMap::new(),
             linetype_handles: std::collections::HashMap::new(),
             xdic_owner_index: std::sync::Arc::new(Self::build_xdic_owner_index(document)),
+            live_handles: std::sync::Arc::new(Self::build_live_handles(document)),
         })
+    }
+
+    fn build_live_handles(document: &CadDocument) -> HashSet<u64> {
+        let mut s: HashSet<u64> = HashSet::new();
+        for e in document.entities() {
+            s.insert(e.common().handle.value());
+            if let EntityType::Insert(i) = e {
+                for a in &i.attributes { s.insert(a.common.handle.value()); }
+                if let Some(h) = i.seqend_handle { s.insert(h.value()); }
+            }
+        }
+        for h in document.objects.keys() { s.insert(h.value()); }
+        macro_rules! tbl { ($t:expr) => { s.insert($t.handle().value()); for x in $t.iter() { s.insert(x.handle().value()); } } }
+        tbl!(document.layers); tbl!(document.line_types); tbl!(document.text_styles); tbl!(document.block_records);
+        tbl!(document.dim_styles); tbl!(document.app_ids); tbl!(document.views); tbl!(document.vports); tbl!(document.ucss);
+        for b in document.block_records.iter() { s.insert(b.block_entity_handle.value()); s.insert(b.block_end_handle.value()); }
+        s
+    }
+
+    /// Reactors that still point at something in this document.
+    pub(super) fn live_reactors(&self, reactors: &[Handle]) -> Vec<Handle> {
+        reactors.iter().copied().filter(|r| self.live_handles.contains(&r.value())).collect()
     }
 
     /// owner → child dictionary (see `xdic_owner_index`). Mirrors the fallback in
@@ -1981,6 +2010,7 @@ impl<'a> DwgObjectWriter<'a> {
             class_counts_complete: true,
             registered_handles: HashSet::with_capacity(handles.len()),
             xdic_owner_index: self.xdic_owner_index.clone(),
+            live_handles: self.live_handles.clone(),
             owner_overrides: std::collections::HashMap::new(),
             linetype_handles: std::collections::HashMap::new(),
         };
